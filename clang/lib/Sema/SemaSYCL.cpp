@@ -689,6 +689,45 @@ static CXXRecordDecl *getKernelObjectType(FunctionDecl *Caller) {
   return (*Caller->param_begin())->getType()->getAsCXXRecordDecl();
 }
 
+static Stmt *copyArray(Sema &S, SourceLocation Loc, QualType T, Expr *To,
+                       Expr *From) {
+  // Compute the size of the memory buffer to be copied.
+  QualType SizeType = S.Context.getSizeType();
+  llvm::APInt Size(S.Context.getTypeSize(SizeType),
+                   S.Context.getTypeSizeInChars(T).getQuantity());
+
+  // Take the address of the field references for "from" and "to"
+  From = new (S.Context)
+      UnaryOperator(From, UO_AddrOf, S.Context.getPointerType(T), VK_RValue,
+                    OK_Ordinary, Loc, false);
+  To = new (S.Context) UnaryOperator(To, UO_AddrOf, S.Context.getPointerType(T),
+                                     VK_RValue, OK_Ordinary, Loc, false);
+
+  // Create a reference to the __builtin_memcpy function
+  StringRef MemCpyName = "__builtin_memcpy";
+  LookupResult R(S, &S.Context.Idents.get(MemCpyName), Loc,
+                 Sema::LookupOrdinaryName);
+  S.LookupName(R, S.TUScope, true);
+
+  FunctionDecl *MemCpy = R.getAsSingle<FunctionDecl>();
+  if (!MemCpy)
+    // Something went horribly wrong earlier, and we will have complained
+    // about it.
+    return nullptr;
+
+  ExprResult MemCpyRef = S.BuildDeclRefExpr(MemCpy, S.Context.BuiltinFnTy,
+                                            VK_RValue, Loc, nullptr);
+  assert(MemCpyRef.isUsable() && "Builtin reference cannot fail");
+
+  Expr *CallArgs[] = {To, From,
+                      IntegerLiteral::Create(S.Context, Size, SizeType, Loc)};
+  ExprResult Call =
+      S.BuildCallExpr(/*Scope=*/nullptr, MemCpyRef.get(), Loc, CallArgs, Loc);
+
+  assert(!Call.isInvalid() && "Call to __builtin_memcpy cannot fail!");
+  return Call.getAs<Stmt>();
+}
+
 // Creates body for new OpenCL kernel. This body contains initialization of SYCL
 // kernel object fields with kernel parameters and a little bit transformed body
 // of the kernel caller function.
@@ -760,6 +799,7 @@ static CompoundStmt *CreateOpenCLKernelBody(Sema &S,
       // arguments as parameters to the __init method.
       auto getExprForSpecialSYCLObj = [&](const QualType &paramTy,
                                           FieldDecl *Field,
+                                          Expr *SpecialObjME,
                                           const CXXRecordDecl *CRD,
                                           Expr *Base,
                                           const std::string &MethodName,
@@ -781,13 +821,15 @@ static CompoundStmt *CreateOpenCLKernelBody(Sema &S,
         if (NumParams)
           std::advance(KernelFuncParam, NumParams - 1);
 
-        DeclAccessPair FieldDAP = DeclAccessPair::make(Field, AS_none);
-        // [kernel_obj or wrapper object].special_obj
-        auto SpecialObjME = MemberExpr::Create(
+        if (!SpecialObjME) {
+          DeclAccessPair FieldDAP = DeclAccessPair::make(Field, AS_none);
+          // [kernel_obj or wrapper object].special_obj
+          SpecialObjME = MemberExpr::Create(
             S.Context, Base, false, SourceLocation(), NestedNameSpecifierLoc(),
             SourceLocation(), Field, FieldDAP,
             DeclarationNameInfo(Field->getDeclName(), SourceLocation()),
             nullptr, Field->getType(), VK_LValue, OK_Ordinary, NOUR_None);
+        }
 
         // [kernel_obj or wrapper object].special_obj.__init
         DeclAccessPair MethodDAP = DeclAccessPair::make(Method, AS_none);
@@ -831,23 +873,55 @@ static CompoundStmt *CreateOpenCLKernelBody(Sema &S,
                       // object or parameter of the previous processed accessor
                       // object.
                       KernelFuncParam++;
-                      getExprForSpecialSYCLObj(FldType, WrapperFld,
-                                               WrapperFldCRD, Base,
-                                               InitMethodName, BodyStmts);
+                      getExprForSpecialSYCLObj(FldType, WrapperFld, nullptr,
+                        WrapperFldCRD, Base,
+                        InitMethodName, BodyStmts);
                     } else {
                       // Field is a structure or class so change the wrapper
                       // object and recursively search for accessor field.
                       DeclAccessPair WrapperFieldDAP =
-                          DeclAccessPair::make(WrapperFld, AS_none);
+                        DeclAccessPair::make(WrapperFld, AS_none);
                       auto NewBase = MemberExpr::Create(
-                          S.Context, Base, false, SourceLocation(),
-                          NestedNameSpecifierLoc(), SourceLocation(),
-                          WrapperFld, WrapperFieldDAP,
-                          DeclarationNameInfo(WrapperFld->getDeclName(),
-                                              SourceLocation()),
-                          nullptr, WrapperFld->getType(), VK_LValue,
-                          OK_Ordinary, NOUR_None);
+                        S.Context, Base, false, SourceLocation(),
+                        NestedNameSpecifierLoc(), SourceLocation(),
+                        WrapperFld, WrapperFieldDAP,
+                        DeclarationNameInfo(WrapperFld->getDeclName(),
+                          SourceLocation()),
+                        nullptr, WrapperFld->getType(), VK_LValue,
+                        OK_Ordinary, NOUR_None);
                       getExprForWrappedAccessorInit(WrapperFldCRD, NewBase);
+                    }
+                  } else if (FldType->isArrayType()) {
+                    QualType ET =
+                        QualType{FldType->getPointeeOrArrayElementType(), 0};
+                    if (Util::isSyclAccessorType(ET)) {
+                      if (const ConstantArrayType *CAT =
+                              S.Context.getAsConstantArrayType(FldType)) {
+                        size_t NumElements =
+                            static_cast<size_t>(CAT->getSize().getZExtValue());
+                        for (size_t I = 0; I < NumElements; ++I) {
+                          FieldDecl *Field = WrapperFld;
+                          DeclAccessPair FieldDAP =
+                              DeclAccessPair::make(Field, AS_none);
+                          auto SpecialObjME = MemberExpr::Create(
+                              S.Context, Base, false, SourceLocation(),
+                              NestedNameSpecifierLoc(), SourceLocation(), Field,
+                              FieldDAP,
+                              DeclarationNameInfo(Field->getDeclName(),
+                                                  SourceLocation()),
+                              nullptr, Field->getType(), VK_LValue, OK_Ordinary,
+                              NOUR_None);
+                          auto Loc = SourceLocation();
+                          ExprResult IndexExpr = S.ActOnIntegerConstant(Loc, I);
+                          auto MA = S.CreateBuiltinArraySubscriptExpr(
+                              SpecialObjME, Loc, IndexExpr.get(), Loc);
+                          KernelFuncParam++;
+                          getExprForSpecialSYCLObj(ET, WrapperFld, MA.get(),
+                                                   ET->getAsCXXRecordDecl(),
+                                                   Base, InitMethodName,
+                                                   BodyStmts);
+                        }
+                      }
                     }
                   }
                 }
@@ -875,8 +949,8 @@ static CompoundStmt *CreateOpenCLKernelBody(Sema &S,
         InitializationSequence InitSeq(S, Entity, InitKind, None);
         ExprResult MemberInit = InitSeq.Perform(S, Entity, InitKind, None);
         InitExprs.push_back(MemberInit.get());
-        getExprForSpecialSYCLObj(FieldType, Field, CRD, KernelObjCloneRef,
-                                 InitMethodName, BodyStmts);
+        getExprForSpecialSYCLObj(FieldType, Field, nullptr, CRD,
+                                 KernelObjCloneRef, InitMethodName, BodyStmts);
       } else if (CRD || FieldType->isScalarType()) {
         // If field has built-in or a structure/class type just initialize
         // this field with corresponding kernel argument using copy
@@ -914,14 +988,56 @@ static CompoundStmt *CreateOpenCLKernelBody(Sema &S,
           if (Util::isSyclStreamType(FieldType)) {
             // Generate call to the __init method of the stream class after
             // initializing accessors wrapped by this stream object
-            getExprForSpecialSYCLObj(FieldType, Field, CRD, KernelObjCloneRef,
-                                     InitMethodName, BodyStmts);
+            getExprForSpecialSYCLObj(FieldType, Field, nullptr, CRD,
+                                     KernelObjCloneRef, InitMethodName,
+                                     BodyStmts);
 
             // Generate call to the __finalize method of stream class.
             // Will put it later to the end of function body.
-            getExprForSpecialSYCLObj(FieldType, Field, CRD, KernelObjCloneRef,
-                                     FinalizeMethodName, FinalizeStmts);
+            getExprForSpecialSYCLObj(FieldType, Field, nullptr, CRD,
+                                     KernelObjCloneRef, FinalizeMethodName,
+                                     FinalizeStmts);
           }
+        }
+      } else if (FieldType->isArrayType()) {
+        QualType ET = QualType{FieldType->getPointeeOrArrayElementType(), 0};
+        if (Util::isSyclAccessorType(ET)) {
+          if (const ConstantArrayType *CAT =
+                  S.Context.getAsConstantArrayType(FieldType)) {
+            size_t NumElements =
+                static_cast<size_t>(CAT->getSize().getZExtValue());
+            DeclAccessPair FieldDAP = DeclAccessPair::make(Field, AS_none);
+            auto Lhs = MemberExpr::Create(
+                S.Context, KernelObjCloneRef, false, SourceLocation(),
+                NestedNameSpecifierLoc(), SourceLocation(), Field, FieldDAP,
+                DeclarationNameInfo(Field->getDeclName(), SourceLocation()),
+                nullptr, Field->getType(), VK_LValue, OK_Ordinary, NOUR_None);
+            for (size_t I = 0; I < NumElements; ++I) {
+              auto Loc = SourceLocation();
+              ExprResult IndexExpr = S.ActOnIntegerConstant(Loc, I);
+              auto MA = S.CreateBuiltinArraySubscriptExpr(Lhs, Loc,
+                                                          IndexExpr.get(), Loc);
+              getExprForSpecialSYCLObj(ET, nullptr, MA.get(),
+                                       ET->getAsCXXRecordDecl(), nullptr,
+                                       InitMethodName, BodyStmts);
+              KernelFuncParam++;
+            }
+          }
+        } else {
+          // Generate memcpy
+          auto Loc = SourceLocation();
+          DeclAccessPair FieldDAP = DeclAccessPair::make(Field, AS_none);
+          auto Lhs = MemberExpr::Create(
+              S.Context, KernelObjCloneRef, false, Loc,
+              NestedNameSpecifierLoc(), Loc, Field, FieldDAP,
+              DeclarationNameInfo(Field->getDeclName(), Loc), nullptr,
+              Field->getType(), VK_LValue, OK_Ordinary, NOUR_None);
+          QualType ParamType = (*KernelFuncParam)->getOriginalType();
+          Expr *Rhs = DeclRefExpr::Create(
+              S.Context, NestedNameSpecifierLoc(), Loc, *KernelFuncParam, false,
+              DeclarationNameInfo(), ParamType, VK_LValue);
+          Stmt *Call = copyArray(S, Loc, ParamType, Lhs, Rhs);
+          BodyStmts.push_back(Call);
         }
       } else {
         llvm_unreachable("Unsupported field type");
@@ -1027,6 +1143,19 @@ static bool buildArgTys(ASTContext &Context, CXXRecordDecl *KernelObj,
                   // accessor fields
                   createParamDescForWrappedAccessors(WrapperFld, FldType);
                 }
+              } else if (FldType->isArrayType()) {
+                QualType ET =
+                    QualType{FldType->getPointeeOrArrayElementType(), 0};
+                if (Util::isSyclAccessorType(ET)) {
+                  if (const ConstantArrayType *CAT =
+                          Context.getAsConstantArrayType(FldType)) {
+                    size_t NumElements =
+                        static_cast<size_t>(CAT->getSize().getZExtValue());
+                    for (size_t I = 0; I < NumElements; ++I) {
+                      createSpecialSYCLObjParamDesc(WrapperFld, ET);
+                    }
+                  }
+                }
               }
             }
           };
@@ -1084,6 +1213,48 @@ static bool buildArgTys(ASTContext &Context, CXXRecordDecl *KernelObj,
       Context.getDiagnostics().Report(
           Fld->getLocation(), diag::err_bad_kernel_param_type) << ArgTy;
       AllArgsAreValid = false;
+    } else if (ArgTy->isArrayType()) {
+      QualType ET = QualType{ArgTy->getPointeeOrArrayElementType(), 0};
+      if (Util::isSyclAccessorType(ET)) {
+        if (const ConstantArrayType *CAT =
+                Context.getAsConstantArrayType(ArgTy)) {
+          size_t NumElements =
+              static_cast<size_t>(CAT->getSize().getZExtValue());
+          for (size_t I = 0; I < NumElements; ++I) {
+            createSpecialSYCLObjParamDesc(Fld, ET);
+          }
+        }
+      } else {
+        // Non-accessor array, check if standard layout
+        if (Context.getLangOpts().SYCLStdLayoutKernelParams) {
+          if (!ArgTy->isStandardLayoutType()) {
+            Context.getDiagnostics().Report(Fld->getLocation(),
+                                            diag::err_sycl_non_std_layout_type)
+                << ArgTy;
+            AllArgsAreValid = false;
+            continue;
+          }
+        }
+        auto wrapAnArray = [&](const QualType ArgTy, RecordDecl *&NewClass,
+                               FieldDecl *&Field) {
+          NewClass = Context.buildImplicitRecord("wrapped_array");
+          NewClass->startDefinition();
+          Field = FieldDecl::Create(
+              Context, NewClass, SourceLocation(), SourceLocation(),
+              /*Id=*/nullptr, ArgTy,
+              Context.getTrivialTypeSourceInfo(ArgTy, SourceLocation()),
+              /*BW=*/nullptr, /*Mutable=*/false, /*InitStyle=*/ICIS_NoInit);
+          Field->setAccess(AS_public);
+          NewClass->addDecl(Field);
+          NewClass->completeDefinition();
+        };
+        RecordDecl *NewClass;
+        FieldDecl *Field;
+        wrapAnArray(ArgTy, NewClass, Field);
+        QualType FT = Context.getRecordType(NewClass);
+        wrapAnArray(FT, NewClass, Field);
+        CreateAndAddPrmDsc(Field, FT);
+      }
     } else if (ArgTy->isPointerType()) {
       // Pointer Arguments need to be in the global address space
       QualType PointeeTy = ArgTy->getPointeeType();
@@ -1156,6 +1327,33 @@ static void populateIntHeader(SYCLIntegrationHeader &H, const StringRef Name,
               populateHeaderForWrappedAccessors(FldType,
                                                 Offset + OffsetInWrapper);
             }
+          } else if (FldType->isArrayType()) {
+            QualType ET = QualType{FldType->getPointeeOrArrayElementType(), 0};
+            if (Util::isSyclAccessorType(ET)) {
+              ASTContext &WrapperCtx = Wrapper->getASTContext();
+              if (const ConstantArrayType *CAT =
+                      WrapperCtx.getAsConstantArrayType(FldType)) {
+                size_t NumElements =
+                    static_cast<size_t>(CAT->getSize().getZExtValue());
+                const auto *Accessor = ET->getAsCXXRecordDecl();
+                ASTContext &AccessorCtx = Accessor->getASTContext();
+                const ASTRecordLayout &AccessorLayout =
+                    AccessorCtx.getASTRecordLayout(Accessor);
+                auto AccessorSize =
+                    AccessorCtx.toBits(AccessorLayout.getSize()) / 8;
+                const ASTRecordLayout &WrapperLayout =
+                    WrapperCtx.getASTRecordLayout(Wrapper);
+                // Get byte offset of the array in wrapper class or struct
+                uint64_t OffsetInWrapper =
+                    WrapperLayout.getFieldOffset(WrapperFld->getFieldIndex()) /
+                    8;
+                for (size_t I = 0; I < NumElements; ++I) {
+                  // This is an accesor - populate the header appropriately
+                  populateHeaderForAccessor(ET, Offset + OffsetInWrapper);
+                  OffsetInWrapper += AccessorSize;
+                }
+              }
+            }
           }
         }
       };
@@ -1199,6 +1397,33 @@ static void populateIntHeader(SYCLIntegrationHeader &H, const StringRef Name,
       // integration header appropriately
       if (ArgTy->isStructureOrClassType()) {
         populateHeaderForWrappedAccessors(ArgTy, Offset);
+      }
+    } else if (ArgTy->isArrayType()) {
+      QualType ET = QualType{ArgTy->getPointeeOrArrayElementType(), 0};
+      if (Util::isSyclAccessorType(ET)) {
+        ASTContext &WrapperCtx = KernelObjTy->getASTContext();
+        if (const ConstantArrayType *CAT =
+                WrapperCtx.getAsConstantArrayType(ArgTy)) {
+          size_t NumElements =
+              static_cast<size_t>(CAT->getSize().getZExtValue());
+          const auto *Accessor = ET->getAsCXXRecordDecl();
+          ASTContext &AccessorCtx = Accessor->getASTContext();
+          const ASTRecordLayout &AccessorLayout =
+              AccessorCtx.getASTRecordLayout(Accessor);
+          auto AccessorSize = AccessorCtx.toBits(AccessorLayout.getSize()) / 8;
+          // Start with offset of array, i.e., offset of first element of array
+          uint64_t OffsetInArray = Offset;
+          for (size_t I = 0; I < NumElements; ++I) {
+            populateHeaderForAccessor(ET, OffsetInArray);
+            OffsetInArray += AccessorSize;
+          }
+        }
+      } else {
+        // Check for standard layout array has been done earlier
+        uint64_t Sz = Ctx.getTypeSizeInChars(Fld->getType()).getQuantity();
+        H.addParamDesc(SYCLIntegrationHeader::kind_std_layout,
+                       static_cast<unsigned>(Sz),
+                       static_cast<unsigned>(Offset));
       }
     } else {
       llvm_unreachable("unsupported kernel parameter type");
